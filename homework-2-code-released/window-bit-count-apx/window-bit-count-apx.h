@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <math.h>
+#include <string.h>
 
 uint64_t N_MERGES = 0; // keep track of how many bucket merges occur
 
@@ -15,14 +16,21 @@ uint64_t N_MERGES = 0; // keep track of how many bucket merges occur
 */
 
 typedef struct {
-    // TODO: Fill me.
-    uint32_t k; // The parameter k determines the relative error of the approximation
-    uint32_t wnd_size; // The size of the sliding window
-    uint32_t n_buckets; // The number of buckets used by the algorithm
-    uint32_t mask; // A mask used to quickly compute the bucket index of a given position
-    uint32_t* buckets; // The array of buckets used by the algorithm
-    uint32_t n_items; // The number of items processed by the algorithm so far
-    uint32_t i_head; // The index of the head of the sliding window
+    uint32_t timestamp;
+    uint32_t size;
+} Bucket;
+
+typedef struct {
+    uint32_t total_bucket;
+    uint32_t wnd_size;
+    Bucket* wnd_buffer;
+    uint32_t count; // not sure if it is needed
+    uint32_t index_oldest; // index pointing to the oldest element    
+    uint32_t index_next;
+    uint32_t now;
+    uint32_t k;
+    uint32_t m;
+    // uint32_t* groups;
 } StateApx;
 
 // k = 1/eps
@@ -31,70 +39,104 @@ typedef struct {
 uint64_t wnd_bit_count_apx_new(StateApx* self, uint32_t wnd_size, uint32_t k) {
     assert(wnd_size >= 1);
     assert(k >= 1);
-
-    // Initialize the state struct
-    self->k = k;
+    
     self->wnd_size = wnd_size;
-    self->n_buckets = ceil(log2(wnd_size)) + 1;
-    self->mask = (1 << self->n_buckets) - 1;
-    self->buckets = (uint32_t*) calloc(1 << self->n_buckets, sizeof(uint32_t));
-    self->n_items = 0;
-    self->i_head = 0;
-
-    // Compute the number of bytes allocated on the heap
-    uint64_t bytes_allocated = sizeof(StateApx) + (1 << self->n_buckets) * sizeof(uint32_t);
-
-    return bytes_allocated;
+    self->index_oldest = 0;
+    self->index_next = 0;
+    self->k = k;
+    self->now = 0;
+    self->count = 0;
+    // self->total_bucket = (2*k)*ceil(log2(wnd_size/k));
+    // // self->total_bucket = 200;
+    self->total_bucket = 0;
+    self->m = ceil(log2(wnd_size/k));
+    for (int i = 0; i <= self->m; i++) {
+        self->total_bucket += (uint32_t)ceil(((int)(k+2)*pow(2, -i)));
+    }
+    uint64_t memory = ((uint64_t)self->total_bucket) * sizeof(Bucket);
+    self->wnd_buffer = (Bucket*) malloc(memory);
+    for (uint32_t i=0; i<self->total_bucket; i++) {
+        self->wnd_buffer[i].size = 0;
+        self->wnd_buffer[i].timestamp = 0;
+    }
+    // printf("self->total_bucket = %d\n", self->total_bucket);
+    return memory;
 }
 
 void wnd_bit_count_apx_destruct(StateApx* self) {
-    // TODO: Fill me.
-    // Make sure you free the memory allocated on the heap.
-     free(self->buckets);
+    free(self->wnd_buffer);
 }
 
 void wnd_bit_count_apx_print(StateApx* self) {
     // This is useful for debugging.
-    printf("k = %u, wnd_size = %u, n_buckets = %u, n_items = %u, i_head = %u\n", 
-        self->k, self->wnd_size, self->n_buckets, self->n_items, self->i_head);
-    for (int i = 0; i < (1 << self->n_buckets); i++) {
-        printf("%u ", self->buckets[i]);
-    }
-    printf("\n");
 }
 
 uint32_t wnd_bit_count_apx_next(StateApx* self, bool item) {
- // Increment the number of items processed
-    self->n_items++;
+    // Add timestamp
+    self->now += 1;
 
-    // Remove the oldest item from the sliding window
-    uint32_t i_tail = (self->i_head + self->wnd_size - 1) & (self->mask);
-    uint32_t bucket_tail = i_tail >> (self->n_buckets - 1);
-    self->buckets[bucket_tail]--;
+    // Check if the oldest bucket is expired
+    if (self->now - self->wnd_buffer[0].timestamp >= self->wnd_size){
+        memmove(self->wnd_buffer,self->wnd_buffer+1, (self->index_next-2)*sizeof(Bucket));
+        self->wnd_buffer[(self->index_next-1)].size = 0;
+        self->wnd_buffer[(self->index_next-1)].timestamp = 0;
+        self->index_next --;
+        self->count = self->count - self->wnd_buffer[0].size;
 
-    // Add the new item to the sliding window
-    uint32_t bucket_head = self->i_head >> (self->n_buckets - 1);
-    self->buckets[bucket_head] += item;
+    }
 
-    // Increment the index of the head of the sliding window
-    self->i_head = (self->i_head + 1) & (self->mask);
-
-    // If the number of items processed is a power of 2, merge the buckets
-    if ((self->n_items & (self->n_items - 1)) == 0) {
-        for (int i = 0; i < self->n_buckets - 1; i++) {
-            uint32_t j = i << 1;
-            self->buckets[i] = self->buckets[j] + self->buckets[j+1];
-            N_MERGES++;
+    // Create new bucket and add to window
+    if(item){
+        if(self->index_next > self->total_bucket){
+            printf("error1111\n");
+            printf("self->total_bucket = %d\n", self->total_bucket);
+            printf("self->index_next = %d\n", self->index_next);
         }
+        else {
+            self->count ++;
+            self->wnd_buffer[self->index_next].timestamp = self->now;
+            self->wnd_buffer[self->index_next].size = 1;
+            self->index_next = self->index_next + 1; 
+            // printf("self->index_next = %u\n", self->index_next);
+            
+            int group_count = 1; 
+            int group_size = 0;
+            // Merge gv
+            uint32_t threshhold = self->k + 2;
+            for (size_t i=self->index_next-1; (int)i>=0; i--) {
+                size_t pointer_bucket = i;
+                // printf("pointer_bucket %zu\n" , pointer_bucket);
+                if (self->wnd_buffer[pointer_bucket].size == group_count) {
+                    group_size += 1;
+                    // printf("group_size = %d\n", group_size);
+                    if (group_size >= threshhold) {
+
+                        N_MERGES ++;
+  
+                        self->wnd_buffer[pointer_bucket].size *= 2;
+                        self->wnd_buffer[pointer_bucket].timestamp = self->wnd_buffer[(pointer_bucket+1)].timestamp;
+                        self->wnd_buffer[(pointer_bucket+1)].size = 0;
+                        self->wnd_buffer[(pointer_bucket+1)].timestamp = 0;
+
+                        memmove(self->wnd_buffer+pointer_bucket+1, self->wnd_buffer+pointer_bucket+2,(self->index_next-1-(pointer_bucket+1))*sizeof(Bucket));
+                        self->wnd_buffer[self->index_next-1].size = 0; 
+                        self->wnd_buffer[self->index_next-1].timestamp = 0; 
+                        self->index_next --;
+                        group_count *= 2;
+                        group_size = 1;
+                        threshhold /= 2;
+                    }    
+                } else {
+                    break;
+                }
+            }
+        }
+        
     }
 
-    // Compute the approximate bit count and return it
-    uint32_t bit_count_apx = 0;
-    for (int i = 0; i < self->n_buckets - 1; i++) {
-        bit_count_apx += self->table[self->buckets[i]];
-    }
-    bit_count_apx += self->table[self->buckets[self->n_buckets - 1]] / self->k;
-    return bit_count_apx;
-}
+    int count_total = self->count - self->wnd_buffer[0].size + 1;
+
+    return count_total;
+} 
 
 #endif // _WINDOW_BIT_COUNT_APX_
